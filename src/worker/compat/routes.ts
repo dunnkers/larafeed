@@ -320,16 +320,18 @@ const parseGoogleFeedStream = (
     return Effect.succeed({ kind: 'url', url: target });
 };
 
-/** Parses `user/-/label/<name>` or `user/<id>/label/<name>`; null when absent. */
+/**
+ * Parses `user/-/label/<name>` or `user/<id>/label/<name>`. Absent values and
+ * other tags (such as `user/-/state/...`) yield undefined and are ignored.
+ */
 const parseGoogleLabel = (
     value: string | null,
 ): Effect.Effect<string | undefined, CompatibilityValidationError> => {
-    if (value === null || value === '') return Effect.succeed(undefined);
-    const match = /^user\/(?:-|\d+)\/label\/(.+)$/u.exec(value);
-    const name = match?.[1]?.trim();
-    return name !== undefined &&
-        name.length > 0 &&
-        name.length <= MAX_CATEGORY_NAME_LENGTH
+    if (value === null) return Effect.succeed(undefined);
+    const match = /^user\/(?:-|\d+)\/label\/(.*)$/u.exec(value);
+    if (match === null) return Effect.succeed(undefined);
+    const name = match[1]?.trim() ?? '';
+    return name.length > 0 && name.length <= MAX_CATEGORY_NAME_LENGTH
         ? Effect.succeed(name)
         : Effect.fail(new CompatibilityValidationError());
 };
@@ -342,15 +344,6 @@ const parseGoogleTitle = (
     return title.length <= MAX_CATEGORY_NAME_LENGTH
         ? Effect.succeed(title)
         : Effect.fail(new CompatibilityValidationError());
-};
-
-const sameFeedUrl = (left: string, right: string): boolean => {
-    if (left === right) return true;
-    try {
-        return new URL(left).href === new URL(right).href;
-    } catch {
-        return false;
-    }
 };
 
 const remoteIp = (context: CompatibilityContext): string =>
@@ -497,25 +490,20 @@ export const registerCompatibilityRoutes = (
         ),
     );
 
-    /** Resolves a stream to a feed the user follows, or null when not followed. */
-    const findSubscribedFeedId = (
+    /** The user's subscription for a stream, or null when not followed. */
+    const findSubscribed = (
         compat: CompatibilityRuntime,
         userId: number,
         stream: GoogleFeedStream,
     ) =>
-        compat.repository
-            .listSubscriptions(userId)
-            .pipe(
-                Effect.map(
-                    (subscriptions) =>
-                        subscriptions.find((subscription) =>
-                            stream.kind === 'id'
-                                ? subscription.feedId === stream.feedId
-                                : sameFeedUrl(subscription.feedUrl, stream.url),
-                        )?.feedId ?? null,
-                ),
-            );
+        compat.subscriptions.service.findSubscribedFeed(
+            userId,
+            stream.kind === 'id'
+                ? { feedId: stream.feedId }
+                : { feedUrl: stream.url },
+        );
 
+    /** Subscribes (idempotently) under the feed-add rate limit. */
     const subscribeGoogle = (
         compat: CompatibilityRuntime,
         userId: number,
@@ -532,21 +520,15 @@ export const registerCompatibilityRoutes = (
                         categoryName: categoryName ?? DEFAULT_GOOGLE_CATEGORY,
                     },
                 );
-            // Re-subscribing does not move an existing subscription; an
-            // explicit label from the client still files it where asked.
-            if (!outcome.createdSubscription && categoryName !== undefined) {
-                yield* compat.subscriptions.service.editSubscription(
-                    userId,
-                    outcome.feedId,
-                    { categoryName },
-                );
-            }
             return outcome.feedId;
         });
+
+    const notFound = () => text('Error=NotFound\n', 404);
 
     app.post(`${GOOGLE_ROOT}/subscription/quickadd`, (context) =>
         protectedGoogle(context, (compat, authentication) =>
             Effect.gen(function* () {
+                const userId = authentication.user.id;
                 const form = yield* requestParameters(context.req.raw);
                 const query = yield* requiredValue(
                     form,
@@ -559,21 +541,26 @@ export const registerCompatibilityRoutes = (
                     : query;
                 const feedId = yield* subscribeGoogle(
                     compat,
-                    authentication.user.id,
+                    userId,
                     feedUrl,
                     undefined,
                 );
                 const subscription =
-                    (yield* compat.repository.listSubscriptions(
-                        authentication.user.id,
-                    )).find((candidate) => candidate.feedId === feedId);
+                    yield* compat.subscriptions.service.findSubscribedFeed(
+                        userId,
+                        { feedId },
+                    );
                 return json({
                     numResults: 1,
                     query,
                     streamId: `feed/${feedId}`,
-                    ...(subscription === undefined
+                    ...(subscription === null
                         ? {}
-                        : { streamName: subscription.title }),
+                        : {
+                              streamName:
+                                  subscription.customFeedName ??
+                                  subscription.feedName,
+                          }),
                 });
             }),
         ),
@@ -588,27 +575,22 @@ export const registerCompatibilityRoutes = (
                 const stream = yield* parseGoogleFeedStream(form.get('s'));
                 const title = yield* parseGoogleTitle(form.get('t'));
                 const addLabel = yield* parseGoogleLabel(form.get('a'));
-                // Larafeed files each subscription in exactly one category, so
-                // `r` (remove label) has no effect beyond what `a` replaces.
-                yield* parseGoogleLabel(form.get('r'));
+                const removeLabel = yield* parseGoogleLabel(form.get('r'));
+                const customFeedName =
+                    title === undefined
+                        ? {}
+                        : { customFeedName: title === '' ? null : title };
 
                 switch (action) {
                     case 'subscribe': {
-                        const existing = yield* findSubscribedFeedId(
+                        const existing = yield* findSubscribed(
                             compat,
                             userId,
                             stream,
                         );
                         let feedId: number;
                         if (existing !== null) {
-                            feedId = existing;
-                            if (addLabel !== undefined) {
-                                yield* compat.subscriptions.service.editSubscription(
-                                    userId,
-                                    feedId,
-                                    { categoryName: addLabel },
-                                );
-                            }
+                            feedId = existing.feedId;
                         } else if (stream.kind === 'url') {
                             feedId = yield* subscribeGoogle(
                                 compat,
@@ -621,38 +603,8 @@ export const registerCompatibilityRoutes = (
                                 new CompatibilityValidationError(),
                             );
                         }
-                        if (title !== undefined) {
-                            yield* compat.subscriptions.service.editSubscription(
-                                userId,
-                                feedId,
-                                { customFeedName: title === '' ? null : title },
-                            );
-                        }
-                        return text('OK');
-                    }
-                    case 'unsubscribe': {
-                        const feedId = yield* findSubscribedFeedId(
-                            compat,
-                            userId,
-                            stream,
-                        );
-                        if (feedId !== null) {
-                            yield* compat.subscriptions.service.unsubscribe(
-                                userId,
-                                feedId,
-                            );
-                        }
-                        return text('OK');
-                    }
-                    case 'edit': {
-                        const feedId = yield* findSubscribedFeedId(
-                            compat,
-                            userId,
-                            stream,
-                        );
-                        if (feedId === null) {
-                            return text('Error=NotFound\n', 404);
-                        }
+                        // Applies to new and existing subscriptions alike, so
+                        // repeating the call converges on the same state.
                         yield* compat.subscriptions.service.editSubscription(
                             userId,
                             feedId,
@@ -660,12 +612,48 @@ export const registerCompatibilityRoutes = (
                                 ...(addLabel === undefined
                                     ? {}
                                     : { categoryName: addLabel }),
-                                ...(title === undefined
+                                ...customFeedName,
+                            },
+                        );
+                        return text('OK');
+                    }
+                    case 'unsubscribe': {
+                        const existing = yield* findSubscribed(
+                            compat,
+                            userId,
+                            stream,
+                        );
+                        if (existing === null) return notFound();
+                        yield* compat.subscriptions.service.unsubscribe(
+                            userId,
+                            existing.feedId,
+                        );
+                        return text('OK');
+                    }
+                    case 'edit': {
+                        const existing = yield* findSubscribed(
+                            compat,
+                            userId,
+                            stream,
+                        );
+                        if (existing === null) return notFound();
+                        // A feed lives in exactly one category; removing its
+                        // label without adding another moves it to the default.
+                        const categoryName =
+                            addLabel ??
+                            (removeLabel !== undefined &&
+                            removeLabel.toLowerCase() ===
+                                existing.categoryName.toLowerCase()
+                                ? DEFAULT_GOOGLE_CATEGORY
+                                : undefined);
+                        yield* compat.subscriptions.service.editSubscription(
+                            userId,
+                            existing.feedId,
+                            {
+                                ...(categoryName === undefined
                                     ? {}
-                                    : {
-                                          customFeedName:
-                                              title === '' ? null : title,
-                                      }),
+                                    : { categoryName }),
+                                ...customFeedName,
                             },
                         );
                         return text('OK');
