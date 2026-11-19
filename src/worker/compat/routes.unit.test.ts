@@ -10,6 +10,7 @@ import {
     SubscriptionRateLimited,
 } from '../subscriptions/errors';
 import type { SubscriptionService } from '../subscriptions/service';
+import { ReaderNotFound } from '../reader/errors';
 import { CompatibilityRateLimited } from './errors';
 import {
     type CompatibilityRepository,
@@ -391,6 +392,48 @@ describe('compatibility protocol routes', () => {
             );
         },
     );
+
+    it('applies a batched Google edit-tag to every item and skips missing ones', async () => {
+        const setRead = vi.fn((_user: number, entryId: number) =>
+            entryId === 4_662
+                ? Effect.fail(new ReaderNotFound())
+                : Effect.succeed({
+                      entryId,
+                      feedId: 8,
+                      read: true,
+                      readChangedAt: 1,
+                      starred: false,
+                      starredAt: null,
+                      archived: false,
+                      archivedAt: null,
+                  }),
+        );
+        const harness = makeHarness({ repository: { setRead } });
+        const response = await harness.app.request(
+            '/api/reader/reader/api/0/edit-tag',
+            {
+                method: 'POST',
+                body: [
+                    'T=token',
+                    'i=tag:google.com,2005:reader/item/0000000000001234',
+                    'i=tag:google.com,2005:reader/item/0000000000001235',
+                    'i=tag:google.com,2005:reader/item/0000000000001236',
+                    'a=user/-/state/com.google/read',
+                ].join('&'),
+                headers: {
+                    'content-type': 'application/x-www-form-urlencoded',
+                    Authorization: 'GoogleLogin auth=opaque-token',
+                },
+            },
+            {} as Env,
+        );
+
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe('OK');
+        expect(setRead.mock.calls.map(([, id]) => id)).toEqual([
+            4_660, 4_661, 4_662,
+        ]);
+    });
 
     it('keeps Google subscription favicon URLs empty', async () => {
         const harness = makeHarness({});

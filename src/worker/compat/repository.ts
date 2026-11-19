@@ -15,6 +15,7 @@ export const MAX_COMPAT_SUBSCRIPTIONS = 2_000;
 export const MAX_COMPAT_ITEM_IDS = 10_000;
 // NetNewsWire requests item contents in batches of 150 IDs.
 export const MAX_GOOGLE_CONTENT_ITEMS = 150;
+export const MAX_GOOGLE_EDIT_TAG_ITEMS = 1_000;
 export const MAX_FEVER_ITEMS = 50;
 
 const SafeId = Schema.Int.check(

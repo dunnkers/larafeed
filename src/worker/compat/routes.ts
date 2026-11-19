@@ -31,6 +31,7 @@ import {
     type CompatibilityRepository,
     MAX_COMPAT_ITEM_IDS,
     MAX_GOOGLE_CONTENT_ITEMS,
+    MAX_GOOGLE_EDIT_TAG_ITEMS,
     makeCompatibilityRepository,
 } from './repository';
 
@@ -750,43 +751,61 @@ export const registerCompatibilityRoutes = (
         protectedGoogle(context, (compat, authentication) =>
             Effect.gen(function* () {
                 const form = yield* requestParameters(context.req.raw);
-                const id = parseCompatibilityItemId(form.get('i') ?? '');
-                if (id === null) {
+                // Clients batch many `i` values into one request
+                // (NetNewsWire sends up to 1000), so apply the edit to each.
+                const values = form.getAll('i');
+                if (
+                    values.length === 0 ||
+                    values.length > MAX_GOOGLE_EDIT_TAG_ITEMS
+                ) {
                     return yield* Effect.fail(
                         new CompatibilityValidationError(),
                     );
                 }
-                const add = form.get('a') ?? '';
-                const remove = form.get('r') ?? '';
+                const ids: number[] = [];
+                for (const value of values) {
+                    const id = parseCompatibilityItemId(value);
+                    if (id === null) {
+                        return yield* Effect.fail(
+                            new CompatibilityValidationError(),
+                        );
+                    }
+                    ids.push(id);
+                }
+                const add = form.getAll('a').join(' ');
+                const remove = form.getAll('r').join(' ');
                 const now = compat.now();
+                const userId = authentication.user.id;
+                const edits: Array<
+                    (id: number) => ReturnType<typeof compat.repository.setRead>
+                > = [];
                 if (add.endsWith('/read')) {
-                    yield* compat.repository.setRead(
-                        authentication.user.id,
-                        id,
-                        true,
-                        now,
+                    edits.push((id) =>
+                        compat.repository.setRead(userId, id, true, now),
                     );
                 } else if (remove.endsWith('/read')) {
-                    yield* compat.repository.setRead(
-                        authentication.user.id,
-                        id,
-                        false,
-                        now,
+                    edits.push((id) =>
+                        compat.repository.setRead(userId, id, false, now),
                     );
                 } else if (add.endsWith('/starred')) {
-                    yield* compat.repository.setStarred(
-                        authentication.user.id,
-                        id,
-                        true,
-                        now,
+                    edits.push((id) =>
+                        compat.repository.setStarred(userId, id, true, now),
                     );
                 } else if (remove.endsWith('/starred')) {
-                    yield* compat.repository.setStarred(
-                        authentication.user.id,
-                        id,
-                        false,
-                        now,
+                    edits.push((id) =>
+                        compat.repository.setStarred(userId, id, false, now),
                     );
+                }
+                // An article the client still lists but the server no longer
+                // has must not abort the rest of the batch.
+                for (const edit of edits) {
+                    for (const id of ids) {
+                        yield* edit(id).pipe(
+                            Effect.catchTag('ReaderNotFound', () =>
+                                Effect.void,
+                            ),
+                        );
+                    }
                 }
                 return text('OK');
             }),
