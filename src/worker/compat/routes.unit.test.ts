@@ -5,12 +5,12 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AuthConfig } from '../auth/config';
 import { AuthenticationFailed } from '../auth/errors';
 import type { AuthService } from '../auth/service';
+import { ReaderNotFound } from '../reader/errors';
 import {
     SubscriptionNotFound,
     SubscriptionRateLimited,
 } from '../subscriptions/errors';
 import type { SubscriptionService } from '../subscriptions/service';
-import { ReaderNotFound } from '../reader/errors';
 import { CompatibilityRateLimited } from './errors';
 import {
     type CompatibilityRepository,
@@ -433,6 +433,101 @@ describe('compatibility protocol routes', () => {
         expect(setRead.mock.calls.map(([, id]) => id)).toEqual([
             4_660, 4_661, 4_662,
         ]);
+    });
+
+    const editTag = (harness: ReturnType<typeof makeHarness>, body: string) =>
+        harness.app.request(
+            '/api/reader/reader/api/0/edit-tag',
+            {
+                method: 'POST',
+                body,
+                headers: {
+                    'content-type': 'application/x-www-form-urlencoded',
+                    Authorization: 'GoogleLogin auth=opaque-token',
+                },
+            },
+            {} as Env,
+        );
+
+    it('applies every a/r tag of a Google edit-tag, skipping malformed ids', async () => {
+        const result = {
+            entryId: 1,
+            feedId: 8,
+            read: true,
+            readChangedAt: 1,
+            starred: true,
+            starredAt: 1,
+            archived: false,
+            archivedAt: null,
+        };
+        const setRead = vi.fn((..._args: [number, number, boolean, number]) =>
+            Effect.succeed(result),
+        );
+        const setStarred = vi.fn(
+            (..._args: [number, number, boolean, number]) =>
+                Effect.succeed(result),
+        );
+        const harness = makeHarness({ repository: { setRead, setStarred } });
+
+        const response = await editTag(
+            harness,
+            'i=4660&i=not-an-id&i=4661&a=user/-/state/com.google/read&a=user/-/state/com.google/starred&r=user/-/state/com.google/read',
+        );
+
+        expect(response.status).toBe(200);
+        expect(
+            setRead.mock.calls.map(([, id, desired]) => [id, desired]),
+        ).toEqual([
+            [4_660, true],
+            [4_661, true],
+            [4_660, false],
+            [4_661, false],
+        ]);
+        expect(setStarred).toHaveBeenCalledTimes(2);
+    });
+
+    it('applies batched Google starred and unread edits', async () => {
+        const setRead = vi.fn((..._args: [number, number, boolean, number]) =>
+            Effect.succeed({} as never),
+        );
+        const setStarred = vi.fn(
+            (..._args: [number, number, boolean, number]) =>
+                Effect.succeed({} as never),
+        );
+        const harness = makeHarness({ repository: { setRead, setStarred } });
+
+        await editTag(harness, 'i=1&i=2&r=user/-/state/com.google/starred');
+        expect(setStarred.mock.calls.map(([, id, on]) => [id, on])).toEqual([
+            [1, false],
+            [2, false],
+        ]);
+        await editTag(harness, 'i=3&i=4&r=user/-/state/com.google/read');
+        expect(setRead.mock.calls.map(([, id, on]) => [id, on])).toEqual([
+            [3, false],
+            [4, false],
+        ]);
+    });
+
+    it('rejects Google edit-tag with no ids or more than 1000 ids', async () => {
+        const harness = makeHarness({});
+        const tooMany = Array.from(
+            { length: 1_001 },
+            (_, index) => `i=${index + 1}`,
+        ).join('&');
+
+        const none = await editTag(harness, 'a=user/-/state/com.google/read');
+        const many = await editTag(
+            harness,
+            `${tooMany}&a=user/-/state/com.google/read`,
+        );
+        const max = await editTag(
+            harness,
+            `${tooMany.slice(0, tooMany.lastIndexOf('&'))}&a=user/-/state/com.google/read`,
+        );
+
+        expect(none.status).toBe(400);
+        expect(many.status).toBe(400);
+        expect(max.status).toBe(200);
     });
 
     it('keeps Google subscription favicon URLs empty', async () => {

@@ -36,6 +36,10 @@ import {
 } from './repository';
 
 const MAX_FORM_BYTES = 64 * 1_024;
+const EDIT_TAG_CONCURRENCY = 8;
+type EditEffect =
+    | ReturnType<CompatibilityRepository['setRead']>
+    | ReturnType<CompatibilityRepository['setStarred']>;
 const MAX_URL_BYTES = 16 * 1_024;
 const GOOGLE_ROOT = '/api/reader/reader/api/0';
 const NO_STORE = 'no-store';
@@ -762,50 +766,47 @@ export const registerCompatibilityRoutes = (
                         new CompatibilityValidationError(),
                     );
                 }
-                const ids: number[] = [];
-                for (const value of values) {
+                // A malformed id (one the client could not encode) must not
+                // reject the whole batch and leave every other article unread.
+                const ids = values.flatMap((value) => {
                     const id = parseCompatibilityItemId(value);
-                    if (id === null) {
-                        return yield* Effect.fail(
-                            new CompatibilityValidationError(),
-                        );
-                    }
-                    ids.push(id);
-                }
-                const add = form.getAll('a').join(' ');
-                const remove = form.getAll('r').join(' ');
+                    return id === null ? [] : [id];
+                });
                 const now = compat.now();
                 const userId = authentication.user.id;
-                const edits: Array<
-                    (id: number) => ReturnType<typeof compat.repository.setRead>
-                > = [];
-                if (add.endsWith('/read')) {
-                    edits.push((id) =>
-                        compat.repository.setRead(userId, id, true, now),
-                    );
-                } else if (remove.endsWith('/read')) {
-                    edits.push((id) =>
-                        compat.repository.setRead(userId, id, false, now),
-                    );
-                } else if (add.endsWith('/starred')) {
-                    edits.push((id) =>
-                        compat.repository.setStarred(userId, id, true, now),
-                    );
-                } else if (remove.endsWith('/starred')) {
-                    edits.push((id) =>
-                        compat.repository.setStarred(userId, id, false, now),
-                    );
+                const { repository } = compat;
+                const edits: Array<(id: number) => EditEffect> = [];
+                for (const [tags, desired] of [
+                    [form.getAll('a'), true],
+                    [form.getAll('r'), false],
+                ] as const) {
+                    for (const tag of tags) {
+                        if (tag.endsWith('/read')) {
+                            edits.push((id) =>
+                                repository.setRead(userId, id, desired, now),
+                            );
+                        } else if (tag.endsWith('/starred')) {
+                            edits.push((id) =>
+                                repository.setStarred(userId, id, desired, now),
+                            );
+                        }
+                    }
                 }
                 // An article the client still lists but the server no longer
-                // has must not abort the rest of the batch.
+                // has must not abort the rest of the batch. Items are
+                // independent, so run a few D1 batches at a time.
                 for (const edit of edits) {
-                    for (const id of ids) {
-                        yield* edit(id).pipe(
-                            Effect.catchTag('ReaderNotFound', () =>
-                                Effect.void,
+                    yield* Effect.forEach(
+                        ids,
+                        (id) =>
+                            edit(id).pipe(
+                                Effect.catchTag(
+                                    'ReaderNotFound',
+                                    () => Effect.void,
+                                ),
                             ),
-                        );
-                    }
+                        { concurrency: EDIT_TAG_CONCURRENCY },
+                    );
                 }
                 return text('OK');
             }),
